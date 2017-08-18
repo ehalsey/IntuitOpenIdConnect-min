@@ -17,6 +17,8 @@ using Microsoft.Extensions.Options;
 using Microsoft.IdentityModel.Protocols.OpenIdConnect;
 using Newtonsoft.Json.Linq;
 using System.Security.Claims;
+using System.Net;
+using System.IO;
 
 namespace TestIntuitAuth
 {
@@ -27,7 +29,9 @@ namespace TestIntuitAuth
             Environment = env;
 
             var builder = new ConfigurationBuilder()
-                .SetBasePath(env.ContentRootPath);
+                .SetBasePath(env.ContentRootPath)
+                .AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
+                .AddJsonFile($"appsettings.{env.EnvironmentName}.json", optional: true);
 
             if (env.IsDevelopment())
             {
@@ -209,6 +213,56 @@ namespace TestIntuitAuth
                 {
                     await context.ForbidAsync();
                     return;
+                }
+
+                if (context.Request.Path.Equals("/create-invoice"))
+                {
+                    var access_token = props.GetTokenValue("access_token");
+                    HttpWebRequest qboApiRequest = (HttpWebRequest)WebRequest.Create(Configuration["QuickBooksAPIEndpoint"] + "/invoice");
+                    qboApiRequest.Method = "POST";
+                    qboApiRequest.Headers["Authorization"] = string.Format("Bearer {0}", access_token);
+                    qboApiRequest.ContentType = "application/json;charset=UTF-8";
+                    qboApiRequest.Accept = "application/json";
+                    var stream = await qboApiRequest.GetRequestStreamAsync();
+                    var jsonString = "{\"Line\": [{\"Amount\": 100.00,\"DetailType\": \"SalesItemLineDetail\",\"SalesItemLineDetail\": {\"ItemRef\": {\"value\": \"1\",\"name\": \"Services\"}}}],\"CustomerRef\": {\"value\": \"1\"}}";
+
+                    using (var streamWriter = new StreamWriter(stream))
+                    {
+                        streamWriter.Write(jsonString);
+                        streamWriter.Flush();
+                    }
+
+                    try
+                    {
+                        // get the response
+                        var apiResponse = await qboApiRequest.GetResponseAsync();
+                        HttpWebResponse qboApiResponse = (HttpWebResponse)apiResponse;
+                        //read qbo api response
+                        using (var qboApiReader = new StreamReader(qboApiResponse.GetResponseStream()))
+                        {
+                            var result = qboApiReader.ReadToEnd();
+                            await WriteHtmlAsync(response, async res =>
+                            {
+                                await res.WriteAsync("Response<br>");
+                                await res.WriteAsync($"{result}");
+                            });
+                            return;
+                        }
+                    }
+                    catch (WebException ex)
+                    {
+                        //if (ex.Message.Contains("401"))
+                        //{
+                        //    //need to get new token from refresh token
+                        //    System.Diagnostics.Debug.WriteLine(ex.Message);
+                        //}
+                        //else
+                        //{
+                        //    System.Diagnostics.Debug.WriteLine(ex.Message);
+                        //    //return "";
+                        //}
+                        //return ex.Message;
+                    }
                 }
 
                 if (context.Request.Path.Equals("/refresh"))

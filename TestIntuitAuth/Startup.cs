@@ -217,51 +217,56 @@ namespace TestIntuitAuth
 
                 if (context.Request.Path.Equals("/create-invoice"))
                 {
-                    var access_token = props.GetTokenValue("access_token");
-                    HttpWebRequest qboApiRequest = (HttpWebRequest)WebRequest.Create(Configuration["QuickBooksAPIEndpoint"] + "/invoice");
-                    qboApiRequest.Method = "POST";
-                    qboApiRequest.Headers["Authorization"] = string.Format("Bearer {0}", access_token);
-                    qboApiRequest.ContentType = "application/json;charset=UTF-8";
-                    qboApiRequest.Accept = "application/json";
-                    var stream = await qboApiRequest.GetRequestStreamAsync();
-                    var jsonString = "{\"Line\": [{\"Amount\": 100.00,\"DetailType\": \"SalesItemLineDetail\",\"SalesItemLineDetail\": {\"ItemRef\": {\"value\": \"1\",\"name\": \"Services\"}}}],\"CustomerRef\": {\"value\": \"1\"}}";
-
-                    using (var streamWriter = new StreamWriter(stream))
+                    var doContinue = true;
+                    while (doContinue)
                     {
-                        streamWriter.Write(jsonString);
-                        streamWriter.Flush();
-                    }
+                        var access_token = props.GetTokenValue("access_token");
+                        HttpWebRequest qboApiRequest = (HttpWebRequest)WebRequest.Create(Configuration["QuickBooksAPIEndpoint"] + "/invoice");
+                        qboApiRequest.Method = "POST";
+                        qboApiRequest.Headers["Authorization"] = string.Format("Bearer {0}", access_token);
+                        qboApiRequest.ContentType = "application/json;charset=UTF-8";
+                        qboApiRequest.Accept = "application/json";
+                        var stream = await qboApiRequest.GetRequestStreamAsync();
+                        var jsonString = "{\"Line\": [{\"Amount\": 100.00,\"DetailType\": \"SalesItemLineDetail\",\"SalesItemLineDetail\": {\"ItemRef\": {\"value\": \"1\",\"name\": \"Services\"}}}],\"CustomerRef\": {\"value\": \"1\"}}";
 
-                    try
-                    {
-                        // get the response
-                        var apiResponse = await qboApiRequest.GetResponseAsync();
-                        HttpWebResponse qboApiResponse = (HttpWebResponse)apiResponse;
-                        //read qbo api response
-                        using (var qboApiReader = new StreamReader(qboApiResponse.GetResponseStream()))
+                        using (var streamWriter = new StreamWriter(stream))
                         {
-                            var result = qboApiReader.ReadToEnd();
-                            await WriteHtmlAsync(response, async res =>
-                            {
-                                await res.WriteAsync("Response<br>");
-                                await res.WriteAsync($"{result}");
-                            });
-                            return;
+                            streamWriter.Write(jsonString);
+                            streamWriter.Flush();
                         }
-                    }
-                    catch (WebException ex)
-                    {
-                        //if (ex.Message.Contains("401"))
-                        //{
-                        //    //need to get new token from refresh token
-                        //    System.Diagnostics.Debug.WriteLine(ex.Message);
-                        //}
-                        //else
-                        //{
-                        //    System.Diagnostics.Debug.WriteLine(ex.Message);
-                        //    //return "";
-                        //}
-                        //return ex.Message;
+
+                        try
+                        {
+                            // get the response
+                            var apiResponse = await qboApiRequest.GetResponseAsync();
+                            HttpWebResponse qboApiResponse = (HttpWebResponse)apiResponse;
+                            //read qbo api response
+                            using (var qboApiReader = new StreamReader(qboApiResponse.GetResponseStream()))
+                            {
+                                var result = qboApiReader.ReadToEnd();
+                                await WriteHtmlAsync(response, async res =>
+                                {
+                                    await res.WriteAsync("Response<br>");
+                                    await res.WriteAsync($"{result}");
+                                });
+                                doContinue = false;
+                                return;
+                            }
+                        }
+                        catch (WebException ex)
+                        {
+                            if (ex.Message.Contains("401"))
+                            {
+                                await GetRefreshToken(optionsMonitor, context, response, user, props);
+                            }
+                            else
+                            {
+                                System.Diagnostics.Debug.WriteLine(ex.Message);
+                                doContinue = false;
+                                return;
+                            }
+                        }
+
                     }
                 }
 
@@ -340,6 +345,64 @@ namespace TestIntuitAuth
 
                 });
             });
+        }
+
+        private static async Task GetRefreshToken(IOptionsMonitor<OpenIdConnectOptions> optionsMonitor, HttpContext context, HttpResponse response, ClaimsPrincipal user, AuthenticationProperties props)
+        {
+            //need to get new token from refresh token
+            var refreshToken = props.GetTokenValue("refresh_token");
+
+            if (string.IsNullOrEmpty(refreshToken))
+            {
+                await WriteHtmlAsync(response, async res =>
+                {
+                    await res.WriteAsync($"No refresh_token is available.<br>");
+                    await res.WriteAsync("<a class=\"btn btn-link\" href=\"/signout\">Sign Out</a>");
+                });
+
+                return;
+            }
+
+            var options = optionsMonitor.Get(OpenIdConnectDefaults.AuthenticationScheme);
+            var metadata = await options.ConfigurationManager.GetConfigurationAsync(context.RequestAborted);
+
+            var pairs = new Dictionary<string, string>()
+                                {
+                                    { "client_id", options.ClientId },
+                                    { "client_secret", options.ClientSecret },
+                                    { "grant_type", "refresh_token" },
+                                    { "refresh_token", refreshToken }
+                                };
+            var content = new FormUrlEncodedContent(pairs);
+            var tokenResponse = await options.Backchannel.PostAsync(metadata.TokenEndpoint, content, context.RequestAborted);
+            tokenResponse.EnsureSuccessStatusCode();
+
+            var payload = JObject.Parse(await tokenResponse.Content.ReadAsStringAsync());
+
+            // Persist the new acess token
+            props.UpdateTokenValue("access_token", payload.Value<string>("access_token"));
+            props.UpdateTokenValue("refresh_token", payload.Value<string>("refresh_token"));
+            if (int.TryParse(payload.Value<string>("expires_in"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var seconds))
+            {
+                var expiresAt = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(seconds);
+                props.UpdateTokenValue("expires_at", expiresAt.ToString("o", CultureInfo.InvariantCulture));
+            }
+            await context.SignInAsync(user, props);
+
+            await WriteHtmlAsync(response, async res =>
+            {
+                await res.WriteAsync($"<h1>Refreshed.</h1>");
+                await res.WriteAsync("<a class=\"btn btn-default\" href=\"/refresh\">Refresh tokens</a>");
+                await res.WriteAsync("<a class=\"btn btn-default\" href=\"/\">Home</a>");
+
+                await res.WriteAsync("<h2>Tokens:</h2>");
+                await WriteTableHeader(res, new string[] { "Token Type", "Value" }, props.GetTokens().Select(token => new string[] { token.Name, token.Value }));
+
+                await res.WriteAsync("<h2>Payload:</h2>");
+                await res.WriteAsync(HtmlEncoder.Default.Encode(payload.ToString()).Replace(",", ",<br>") + "<br>");
+            });
+
+            return;
         }
 
         private static async Task WriteHtmlAsync(HttpResponse response, Func<HttpResponse, Task> writeContent)
